@@ -423,7 +423,8 @@ function dropAndResolve(boardIn, col, value) {
       c = c - 1; continue;
     }
     // ③ 与右侧紧邻相同 → 右块左移合并（结果仍在左格，位置不变）
-    if (c + 1 < cols && board[r][c + 1] === v) {
+    //    边界保护：仅当右块是它所在列的堆顶（上方无块）才合并，防止抽走中部块导致其上方块悬空
+    if (c + 1 < cols && board[r][c + 1] === v && (r === 0 || board[r - 1][c + 1] === 0)) {
       board[r][c] = v * 2; board[r][c + 1] = 0;
       score += v * 2; maxNew = Math.max(maxNew, v * 2);
       events.push({ type: 'merge', from: [r, c + 1], to: [r, c], value: v * 2 });
