@@ -181,6 +181,11 @@ button { font-family: inherit; border:none; background:none; cursor:pointer; col
 }
 .switch.on { background: var(--accent); }
 .switch.on::after { left:24px; }
+.export-btn {
+  flex:none; padding:8px 14px; border-radius:10px; background:var(--accent); color:#fff;
+  font-size:13px; font-weight:700; transition: opacity .15s ease;
+}
+.export-btn:hover { opacity:.85; }
 .ach-section { padding:14px 2px 4px; }
 .ach-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:10px; }
 .ach-item {
@@ -302,6 +307,10 @@ button { font-family: inherit; border:none; background:none; cursor:pointer; col
       <div class="setting-name">成就墙</div>
       <div class="ach-grid" id="achGrid"></div>
     </div>
+    <div class="setting-row">
+      <div><div class="setting-name">调试：导出操作记录</div><div class="setting-desc">导出本局每步落子与盘面，方便反馈问题时排查</div></div>
+      <button class="export-btn" id="exportBtn">导出</button>
+    </div>
     <button class="danger-btn" id="resetBtn">清空纪录与成就</button>
   </div>
 </div>
@@ -364,7 +373,7 @@ button { font-family: inherit; border:none; background:none; cursor:pointer; col
 'use strict';
 
 const MODES = { '5x8': { rows: 8, cols: 5 }, '6x10': { rows: 10, cols: 6 } };
-const CHAIN_LIMIT = 24;          // 连锁步数防御上限
+const CHAIN_LIMIT = 128;         // 稳定化循环步数防御上限（全盘合并次数 + 重力轮次）
 const MILESTONE_MIN = 16;        // 里程碑起点
 const SPAWN_P = { 2: 0.7, 4: 0.2, 8: 0.1 };   // 掉落概率（PRD 附录 B）
 
@@ -412,11 +421,15 @@ function applyGravity(board, events) {
 
 /**
  * 落子 + 合成连锁（核心，唯一规则实现）
+ * 规则：向下 > 向左 > 向右，仅紧邻合成；合并后全盘重力补位。
+ * 采用「稳定化」模型：落子后反复「重力沉降 + 扫描合并」，直到棋盘
+ * 既无悬空洞、也无任何相邻同值——从根上消除「相邻同值不合并」。
+ * 扫描顺序自上而下、自左向右；每块先查向下、再查向右（向左/向上由邻居块覆盖）。
  * @param {number[][]} boardIn 棋盘（r=0 为顶行，块堆在底部）
  * @param {number} col 目标列
  * @param {number} value 掉落数字
  * @returns 事件序列 + 结果棋盘 + 得分 + 结束判定；列满返回 null
- * events: [{type:'drop', r, c, value}, {type:'merge', from:[r,c], to:[r,c], value}]
+ * events: [{type:'drop',...}, {type:'merge', from, to, value}, {type:'fall', from, to, value}]
  */
 function dropAndResolve(boardIn, col, value) {
   const rows = boardIn.length, cols = boardIn[0].length;
@@ -429,42 +442,40 @@ function dropAndResolve(boardIn, col, value) {
   events.push({ type: 'drop', r: r, c: c, value: value });
 
   let score = 0, maxNew = 0, steps = 0;
+
   while (steps < CHAIN_LIMIT) {
     steps++;
-    const v = board[r][c];
-    if (v === 0) break;                          // 防御
-    // ① 向下合并（优先级最高）
-    if (r + 1 < rows && board[r + 1][c] === v) {
-      board[r + 1][c] = v * 2; board[r][c] = 0;
-      score += v * 2; maxNew = Math.max(maxNew, v * 2);
-      events.push({ type: 'merge', from: [r, c], to: [r + 1, c], value: v * 2 });
-      applyGravity(board, events);               // 空出的上方由本列/全盘重力补位
-      r = r + 1; c = c;                          // 活动块下沉一格（合并结果位置）
-      continue;
+    // ① 全盘重力沉降（向下补位，消除悬空）
+    applyGravity(board, events);
+
+    // ② 扫描找第一个相邻同值对（自上而下、自左向右；每块先向下、再向右）
+    let found = null;                            // { from:[r,c], to:[r,c] }
+    for (let rr = 0; rr < rows && !found; rr++) {
+      for (let cc = 0; cc < cols && !found; cc++) {
+        const v = board[rr][cc];
+        if (v === 0) continue;
+        // 向下合并（优先级最高）：与正下方同值 → 结果在下格
+        if (rr + 1 < rows && board[rr + 1][cc] === v) {
+          found = { from: [rr, cc], to: [rr + 1, cc] };
+        }
+        // 向右合并：与右侧紧邻同值 → 右块左移，结果在左格（当前格）
+        else if (cc + 1 < cols && board[rr][cc + 1] === v) {
+          found = { from: [rr, cc + 1], to: [rr, cc] };
+        }
+      }
     }
-    // ② 与左侧紧邻相同 → 向左合并（结果在左格）
-    if (c - 1 >= 0 && board[r][c - 1] === v) {
-      board[r][c - 1] = v * 2; board[r][c] = 0;
-      score += v * 2; maxNew = Math.max(maxNew, v * 2);
-      events.push({ type: 'merge', from: [r, c], to: [r, c - 1], value: v * 2 });
-      applyGravity(board, events);               // 空出的上方由重力补位
-      r = r; c = c - 1;                          // 活动块左移一格（合并结果在左格）
-      continue;
-    }
-    // ③ 与右侧紧邻相同 → 右块左移合并（结果仍在左格，活动块位置不变）
-    if (c + 1 < cols && board[r][c + 1] === v) {
-      board[r][c] = v * 2; board[r][c + 1] = 0;
-      score += v * 2; maxNew = Math.max(maxNew, v * 2);
-      events.push({ type: 'merge', from: [r, c + 1], to: [r, c], value: v * 2 });
-      applyGravity(board, events);               // 抽走的右列上方由重力补位
-      continue;
-    }
-    break;                                       // 连锁终止
+    if (!found) break;                           // 稳定：无相邻同值，也无悬空
+
+    const nv = board[found.from[0]][found.from[1]] * 2;
+    board[found.to[0]][found.to[1]] = nv;
+    board[found.from[0]][found.from[1]] = 0;
+    score += nv; maxNew = Math.max(maxNew, nv);
+    events.push({ type: 'merge', from: found.from, to: found.to, value: nv });
   }
 
   // 结束判定（连锁完成后）：任一列堆到顶
   let gameOver = false;
-  for (let cc = 0; cc < cols; cc++) if (colHeight(board, cc) >= rows) { gameOver = true; break; }
+  for (let cc2 = 0; cc2 < cols; cc2++) if (colHeight(board, cc2) >= rows) { gameOver = true; break; }
   return { events: events, board: board, score: score, gameOver: gameOver, maxNew: maxNew };
 }
 
@@ -529,7 +540,8 @@ var state = {
   maxTileThisRun: 0, reached2048ThisRun: false,
   bestScore: 0, milestones: [], muted: false, hintOn: true,
   cellSize: 64, gap: 8, pad: 10,
-  hintCol: -1, hintTimer: null
+  hintCol: -1, hintTimer: null,
+  history: []                           // 操作步骤记录（调试导出用）
 };
 var tileMap = {};                       // "r,c" -> tile 元素
 var cellEls = [];                       // cellEls[r][c]
@@ -544,6 +556,66 @@ var boardEl, cellsWrap, tilesWrap, hintColEl, scoreEl, bestEl, nextTileEl,
 /* ---------- 工具 ---------- */
 function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 function fmt(n) { return n.toLocaleString('zh-CN'); }
+
+/* ---------- 调试：操作步骤导出 ---------- */
+function boardAscii(b) {
+  var out = [];
+  for (var r = 0; r < b.length; r++) {
+    var row = [];
+    for (var c = 0; c < b[r].length; c++) row.push(b[r][c] === 0 ? '·' : String(b[r][c]));
+    out.push('  ' + row.join('  '));
+  }
+  return out.join('\n');
+}
+function buildDebugLog() {
+  var L = [];
+  L.push('2048 合成游戏 · 操作步骤记录');
+  L.push('模式: ' + state.mode + ' (' + state.rows + '行×' + state.cols + '列)');
+  L.push('导出时间: ' + new Date().toLocaleString('zh-CN'));
+  L.push('总步数: ' + state.moves + ' | 当前得分: ' + state.score + ' | 最高纪录: ' + state.bestScore);
+  L.push('');
+  if (!state.history.length) {
+    L.push('（本局还没有落子记录）');
+  } else {
+    state.history.forEach(function (h) {
+      L.push('第 ' + h.step + ' 步：落 ' + h.value + ' 到第 ' + (h.col + 1) + ' 列 | 本步得分 ' + h.gain + ' | 累计 ' + h.score);
+      L.push('事件: ' + h.events.map(function (e) {
+        if (e.type === 'drop') return '落(' + e.r + ',' + e.c + ')';
+        if (e.type === 'merge') return '合' + e.value + '(' + e.from.join(',') + '→' + e.to.join(',') + ')';
+        return '落' + e.value + '(' + e.from.join(',') + '→' + e.to.join(',') + ')';
+      }).join(' '));
+      L.push(boardAscii(h.board));
+      L.push('');
+    });
+  }
+  L.push('当前盘面:');
+  L.push(boardAscii(state.board));
+  return L.join('\n');
+}
+function copyTextToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () {});
+      return true;
+    }
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) { return false; }
+}
+function downloadText(text) {
+  try {
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = '2048调试记录_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.txt';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+  } catch (e) {}
+}
 
 /* ---------- 布局与渲染 ---------- */
 function pos(r, c) {
@@ -725,6 +797,8 @@ function doUndo() {
   var snap = state.undoStack.pop();
   state.undoLeft--;
   state.board = snap.board; state.score = snap.score; state.maxTileThisRun = snap.maxTileThisRun;
+  state.moves = Math.max(0, state.moves - 1);
+  state.history = state.history.slice(0, state.moves);   // 回退操作记录
   sfxUndo();
   renderAllTiles();
   updateScoreUI();
@@ -780,6 +854,16 @@ async function dropAt(c) {
 
   state.board = result.board;
   state.moves++;
+  /* 记录操作步骤（调试导出用） */
+  state.history.push({
+    step: state.moves,
+    col: c,
+    value: v,
+    gain: result.score,
+    score: state.score,
+    board: cloneBoard(result.board),
+    events: result.events
+  });
   if (result.maxNew > state.maxTileThisRun) state.maxTileThisRun = result.maxNew;
   if (merges.some(function (m) { return m.value >= 2048; })) state.reached2048ThisRun = true;
 
@@ -983,6 +1067,7 @@ function newRun() {
   state.score = 0; state.moves = 0;
   state.undoStack = []; state.undoLeft = 3;
   state.maxTileThisRun = 0; state.reached2048ThisRun = false;
+  state.history = [];
   state.phase = 'idle';
   state.nextTile = spawnTile();
   updateNextTile();
@@ -1102,6 +1187,17 @@ function init() {
     if (state.hintOn) scheduleHint(); else { cancelHintTimer(); clearHint(); }
   });
   $('soundSwitch').addEventListener('click', toggleMute);
+  $('exportBtn').addEventListener('click', function () {
+    sfxButton();
+    var txt = buildDebugLog();
+    if (copyTextToClipboard(txt)) {
+      askConfirm('操作记录已复制到剪贴板，可粘贴发给开发者排查。是否同时下载为 .txt 文件？').then(function (ok) {
+        if (ok) downloadText(txt);
+      });
+    } else {
+      downloadText(txt);
+    }
+  });
   $('resetBtn').addEventListener('click', function () {
     sfxButton();
     askConfirm('确定清空纪录与成就吗？').then(function (ok) {
