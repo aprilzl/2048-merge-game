@@ -408,6 +408,9 @@ function dropAndResolve(boardIn, col, value) {
     steps++;
     const v = board[r][c];
     if (v === 0) break;                          // 防御
+    // ⓪ 防悬空不变式：当前块若被上方块压住（连锁跨列后进入更高列的腰部），
+    //    任何方向的合并都会使其上方块悬空 → 连锁在此终止
+    if (r > 0 && board[r - 1][c] !== 0) break;
     // ① 向下合并（优先级最高）
     if (r + 1 < rows && board[r + 1][c] === v) {
       board[r + 1][c] = v * 2; board[r][c] = 0;
