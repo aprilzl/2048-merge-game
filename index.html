@@ -386,6 +386,31 @@ function colHeight(board, c) {
 }
 
 /**
+ * 重力沉降：把每一列的数字压到底部，消除所有悬空洞（向下补位）。
+ * 若传入 events，则把每个下落块记录为 {type:'fall', from, to, value}。
+ * @returns 下落块数量（无 events 时也返回，便于断言）
+ */
+function applyGravity(board, events) {
+  const rows = board.length, cols = board[0].length;
+  let count = 0;
+  for (let c = 0; c < cols; c++) {
+    let write = rows - 1;                       // 从底部开始写
+    for (let r = rows - 1; r >= 0; r--) {
+      if (board[r][c] !== 0) {
+        if (write !== r) {
+          board[write][c] = board[r][c];
+          board[r][c] = 0;
+          if (events) events.push({ type: 'fall', from: [r, c], to: [write, c], value: board[write][c] });
+          count++;
+        }
+        write--;
+      }
+    }
+  }
+  return count;
+}
+
+/**
  * 落子 + 合成连锁（核心，唯一规则实现）
  * @param {number[][]} boardIn 棋盘（r=0 为顶行，块堆在底部）
  * @param {number} col 目标列
@@ -408,29 +433,30 @@ function dropAndResolve(boardIn, col, value) {
     steps++;
     const v = board[r][c];
     if (v === 0) break;                          // 防御
-    // ⓪ 防悬空不变式：当前块若被上方块压住（连锁跨列后进入更高列的腰部），
-    //    任何方向的合并都会使其上方块悬空 → 连锁在此终止
-    if (r > 0 && board[r - 1][c] !== 0) break;
     // ① 向下合并（优先级最高）
     if (r + 1 < rows && board[r + 1][c] === v) {
       board[r + 1][c] = v * 2; board[r][c] = 0;
       score += v * 2; maxNew = Math.max(maxNew, v * 2);
       events.push({ type: 'merge', from: [r, c], to: [r + 1, c], value: v * 2 });
-      r = r + 1; continue;
+      applyGravity(board, events);               // 空出的上方由本列/全盘重力补位
+      r = r + 1; c = c;                          // 活动块下沉一格（合并结果位置）
+      continue;
     }
     // ② 与左侧紧邻相同 → 向左合并（结果在左格）
     if (c - 1 >= 0 && board[r][c - 1] === v) {
       board[r][c - 1] = v * 2; board[r][c] = 0;
       score += v * 2; maxNew = Math.max(maxNew, v * 2);
       events.push({ type: 'merge', from: [r, c], to: [r, c - 1], value: v * 2 });
-      c = c - 1; continue;
+      applyGravity(board, events);               // 空出的上方由重力补位
+      r = r; c = c - 1;                          // 活动块左移一格（合并结果在左格）
+      continue;
     }
-    // ③ 与右侧紧邻相同 → 右块左移合并（结果仍在左格，位置不变）
-    //    边界保护：仅当右块是它所在列的堆顶（上方无块）才合并，防止抽走中部块导致其上方块悬空
-    if (c + 1 < cols && board[r][c + 1] === v && (r === 0 || board[r - 1][c + 1] === 0)) {
+    // ③ 与右侧紧邻相同 → 右块左移合并（结果仍在左格，活动块位置不变）
+    if (c + 1 < cols && board[r][c + 1] === v) {
       board[r][c] = v * 2; board[r][c + 1] = 0;
       score += v * 2; maxNew = Math.max(maxNew, v * 2);
       events.push({ type: 'merge', from: [r, c + 1], to: [r, c], value: v * 2 });
+      applyGravity(board, events);               // 抽走的右列上方由重力补位
       continue;
     }
     break;                                       // 连锁终止
@@ -469,7 +495,7 @@ function computeHint(boardIn, nextTile) {
 
 /* Node 验证脚本导出钩子（浏览器中 module 未定义，自动跳过） */
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { MODES, spawnTile, cloneBoard, colHeight, dropAndResolve, computeHint };
+  module.exports = { MODES, spawnTile, cloneBoard, colHeight, applyGravity, dropAndResolve, computeHint };
 }
 </script>
 
@@ -673,6 +699,22 @@ function animateMerge(m) {
   });
 }
 
+/* ---------- 下落补位动画（180ms，重力让数字落到底部空位） ---------- */
+function animateFall(f) {
+  var fromKey = f.from.join(','), toKey = f.to.join(',');
+  var el = tileMap[fromKey];
+  if (!el) { delete tileMap[fromKey]; return sleep(0); }
+  delete tileMap[fromKey];
+  tileMap[toKey] = el;
+  var p = pos(f.to[0], f.to[1]);
+  return new Promise(function (res) {
+    el.style.zIndex = '3';
+    el.style.transition = 'left 180ms ease-in, top 180ms ease-in';
+    el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
+    setTimeout(function () { el.style.transition = ''; el.style.zIndex = ''; res(); }, 190);
+  });
+}
+
 /* ---------- 悔棋 ---------- */
 function pushUndo() {
   state.undoStack.push({ board: cloneBoard(state.board), score: state.score, maxTileThisRun: state.maxTileThisRun });
@@ -723,11 +765,17 @@ async function dropAt(c) {
 
   state.phase = 'resolving';
   var merges = result.events.filter(function (ev) { return ev.type === 'merge'; });
-  for (var i = 0; i < merges.length; i++) {
-    sfxMerge(merges[i].value);
-    await animateMerge(merges[i]);
-    state.score += merges[i].value;
-    updateScoreUI();
+  var seq = result.events.slice(1);   // 跳过首个 drop 事件，其余按发生顺序播放
+  for (var i = 0; i < seq.length; i++) {
+    var ev = seq[i];
+    if (ev.type === 'merge') {
+      sfxMerge(ev.value);
+      await animateMerge(ev);
+      state.score += ev.value;
+      updateScoreUI();
+    } else if (ev.type === 'fall') {
+      await animateFall(ev);
+    }
   }
 
   state.board = result.board;
